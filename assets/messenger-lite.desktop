@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=Messenger
+GenericName=Chat & Messaging
+Comment=Lightweight Facebook Messenger Web Desktop Client
+Exec=messenger-lite
+Icon=messenger-lite
+Terminal=false
+Type=Application
+Categories=Network;InstantMessaging;Chat;
+StartupNotify=true
+StartupWMClass=messenger-lite
+X-Hyprland-Class=messenger-lite
+MimeType=x-scheme-handler/messenger;

@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import urllib.parse
 import time
+import json
 
 # ---------------------------------------------------------
 # Chromium & Qt Optimization Flags
@@ -373,11 +374,47 @@ class MessengerWindow(QMainWindow):
         settings.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.DnsPrefetchEnabled, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.FocusOnNavigationEnabled, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanAccessClipboard, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanPaste, True)
 
         # Connect download handler
         self.profile.downloadRequested.connect(self.on_download_requested)
+
+        # Subframe helper script for iframe focus & captcha response injection
+        subframe_helper = QWebEngineScript()
+        subframe_helper.setName("subframe_focus_captcha_helper")
+        subframe_helper.setSourceCode("""
+        (function() {
+            function ensureFocus(target) {
+                if (!target) return;
+                var tag = target.tagName ? target.tagName.toUpperCase() : '';
+                if (tag === 'INPUT' || tag === 'TEXTAREA' || target.isContentEditable) {
+                    target.focus();
+                }
+            }
+
+            document.addEventListener('pointerdown', function(e) { ensureFocus(e.target); }, true);
+            document.addEventListener('mousedown', function(e) { ensureFocus(e.target); }, true);
+            document.addEventListener('click', function(e) { ensureFocus(e.target); }, true);
+
+            window.addEventListener('message', function(ev) {
+                if (ev.data && ev.data.type === 'FILL_CAPTCHA') {
+                    var inputs = document.querySelectorAll('input#audio-response, input[name="audio-response"], input.rc-response-input-field, input[type="text"]');
+                    for (var i = 0; i < inputs.length; i++) {
+                        inputs[i].focus();
+                        inputs[i].value = ev.data.text;
+                        inputs[i].dispatchEvent(new Event('input', { bubbles: true }));
+                        inputs[i].dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                }
+            });
+        })();
+        """)
+        subframe_helper.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
+        subframe_helper.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        subframe_helper.setRunsOnSubFrames(True)
+        self.profile.scripts().insert(subframe_helper)
 
         # Inject click interceptor for external links
         link_script = QWebEngineScript()
@@ -448,9 +485,12 @@ class MessengerWindow(QMainWindow):
         self.web_view = QWebEngineView(self)
         self.web_view.setPage(self.web_page)
         self.web_view.setStyleSheet("background-color: #18191a;")
+        self.web_view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         layout.addWidget(self.web_view)
 
         self.setCentralWidget(container)
+        container.setFocusProxy(self.web_view)
+        self.setFocusProxy(self.web_view)
 
         # Connect loading & title signals
         self.web_view.loadStarted.connect(self.on_load_started)
@@ -518,6 +558,10 @@ class MessengerWindow(QMainWindow):
         mute_action.toggled.connect(self.toggle_mute)
         self.tray_menu.addAction(mute_action)
 
+        captcha_action = QAction("Enter CAPTCHA Response (Ctrl+I)", self)
+        captcha_action.triggered.connect(self.prompt_captcha_input)
+        self.tray_menu.addAction(captcha_action)
+
         self.tray_menu.addSeparator()
 
         quit_action = QAction("Quit Messenger", self)
@@ -533,10 +577,36 @@ class MessengerWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+W"), self, self.hide_to_tray)
         QShortcut(QKeySequence("Ctrl+R"), self, self.reload_page)
         QShortcut(QKeySequence("F5"), self, self.reload_page)
+        QShortcut(QKeySequence("Ctrl+I"), self, self.prompt_captcha_input)
         QShortcut(QKeySequence("Ctrl+="), self, self.zoom_in)
         QShortcut(QKeySequence("Ctrl++"), self, self.zoom_in)
         QShortcut(QKeySequence("Ctrl+-"), self, self.zoom_out)
         QShortcut(QKeySequence("Ctrl+0"), self, self.zoom_reset)
+
+    def prompt_captcha_input(self):
+        """Native dialog helper to inject audio CAPTCHA response across all frames"""
+        from PyQt6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getText(
+            self,
+            "CAPTCHA Input Helper",
+            "Enter the audio verification response (what you heard):",
+            text=""
+        )
+        if ok and text.strip():
+            val = json.dumps(text.strip())
+            js = f"""
+            (function() {{
+                var msg = {{ type: 'FILL_CAPTCHA', text: {val} }};
+                window.postMessage(msg, '*');
+                var iframes = document.querySelectorAll('iframe');
+                for (var i = 0; i < iframes.length; i++) {{
+                    try {{
+                        iframes[i].contentWindow.postMessage(msg, '*');
+                    }} catch (e) {{}}
+                }}
+            }})();
+            """
+            self.web_page.runJavaScript(js)
 
     def zoom_in(self):
         factor = self.web_view.zoomFactor()

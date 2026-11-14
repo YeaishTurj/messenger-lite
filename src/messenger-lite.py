@@ -147,6 +147,25 @@ def get_base_icon() -> QIcon:
     return QIcon(pix)
 
 # ---------------------------------------------------------
+# Meta / Facebook Allowed Authentication & Checkpoint Domains
+# ---------------------------------------------------------
+ALLOWED_AUTH_DOMAINS = (
+    "messenger.com",
+    "facebook.com",
+    "fb.com",
+    "fbcdn.net",
+    "fbsbx.com",       # Meta static/sandbox (CAPTCHA & security checkpoints)
+    "facebook.net",
+    "meta.com",
+    "m.me",
+    "instagram.com",
+    "accountkit.com",
+    "recaptcha.net",   # Google reCAPTCHA
+    "gstatic.com",     # Google static assets
+    "google.com",      # Google reCAPTCHA endpoints
+)
+
+# ---------------------------------------------------------
 # External URL Dispatcher (Wayland & Linux Native)
 # ---------------------------------------------------------
 _last_opened_url = None
@@ -158,6 +177,9 @@ def clean_external_url(url_str: str) -> str:
         return ""
     try:
         parsed = urllib.parse.urlparse(url_str)
+        # Never unwrap internal authentication checkpoints like fbsbx.com/captcha
+        if "fbsbx.com" in parsed.netloc or "/captcha/" in parsed.path or "/checkpoint/" in parsed.path:
+            return url_str
         if any(d in parsed.netloc for d in ("facebook.com", "messenger.com", "wl.co")):
             qs = urllib.parse.parse_qs(parsed.query)
             if "u" in qs and qs["u"]:
@@ -228,12 +250,20 @@ class ExternalLinkPage(QWebEnginePage):
         if self.has_dispatched:
             return
         url_str = url.toString()
-        if url_str and url_str not in ("about:blank", "about:"):
-            self.has_dispatched = True
-            open_external_url(url_str)
-            self.deleteLater()
+        host = url.host().lower()
+
+        # Do not dispatch internal authentication checkpoints or CAPTCHAs to external browser
+        if any(d in host for d in ALLOWED_AUTH_DOMAINS) or not url_str or url_str in ("about:blank", "about:"):
+            return
+
+        self.has_dispatched = True
+        open_external_url(url_str)
+        self.deleteLater()
 
     def acceptNavigationRequest(self, url: QUrl, nav_type, is_main_frame):
+        host = url.host().lower()
+        if any(d in host for d in ALLOWED_AUTH_DOMAINS) or not is_main_frame:
+            return super().acceptNavigationRequest(url, nav_type, is_main_frame)
         url_str = url.toString()
         if url_str and url_str not in ("about:blank", "about:"):
             self._dispatch_once(url)
@@ -251,8 +281,8 @@ class MessengerWebPage(QWebEnginePage):
 
     def on_feature_permission_requested(self, security_origin: QUrl, feature):
         host = security_origin.host()
-        # Automatically allow media devices and notifications for Messenger & Facebook
-        if any(d in host for d in ("messenger.com", "facebook.com", "fbcdn.net", "meta.com")):
+        # Automatically allow media devices and notifications for Messenger, Facebook & checkpoints
+        if any(d in host for d in ALLOWED_AUTH_DOMAINS):
             try:
                 policy = getattr(QWebEnginePage.PermissionPolicy, 'PermissionGrantedByUser', None)
                 if policy is None:
@@ -270,19 +300,27 @@ class MessengerWebPage(QWebEnginePage):
                 pass
 
     def acceptNavigationRequest(self, url: QUrl, nav_type, is_main_frame):
+        # 1. Subframes (iframes for CAPTCHA, authentication, embeds) MUST always load internally
+        if not is_main_frame:
+            return True
+
         host = url.host().lower()
         url_str = url.toString()
 
-        # Always permit internal Messenger and Facebook traffic, oauth, websocket, blob
+        # 2. Allow empty or internal browser schemes
         if (
             not host
-            or any(d in host for d in ("messenger.com", "facebook.com", "fbcdn.net", "meta.com"))
             or url.scheme() in ("blob", "data", "about", "wss", "ws")
         ):
             return True
 
-        # Any external URL: open directly in system default browser!
+        # 3. Allow all Meta login, OAuth, checkpoint, and CAPTCHA domains
+        if any(d in host for d in ALLOWED_AUTH_DOMAINS):
+            return True
+
+        # 4. Any external URL (e.g. YouTube, GitHub, news): open in default browser!
         open_external_url(url_str)
+        return False
         return False
 
     def createWindow(self, window_type):
@@ -346,6 +384,11 @@ class MessengerWindow(QMainWindow):
         link_script.setName("messenger_external_link_interceptor")
         link_script.setSourceCode("""
         (function() {
+            const allowed = [
+                'messenger.com', 'facebook.com', 'fb.com', 'fbcdn.net',
+                'fbsbx.com', 'facebook.net', 'meta.com', 'm.me',
+                'instagram.com', 'recaptcha.net', 'gstatic.com', 'google.com'
+            ];
             document.addEventListener('click', function(e) {
                 let el = e.target;
                 while (el && el.tagName !== 'A') {
@@ -357,7 +400,8 @@ class MessengerWindow(QMainWindow):
                         try {
                             const url = new URL(href);
                             const host = url.hostname.toLowerCase();
-                            if (!host.includes('messenger.com') && !host.includes('facebook.com') && !host.includes('fbcdn.net') && !host.includes('meta.com')) {
+                            const isInternal = allowed.some(d => host === d || host.endsWith('.' + d));
+                            if (!isInternal) {
                                 e.preventDefault();
                                 e.stopPropagation();
                                 window.open(href, '_blank');
@@ -370,7 +414,7 @@ class MessengerWindow(QMainWindow):
         """)
         link_script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
         link_script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
-        link_script.setRunsOnSubFrames(True)
+        link_script.setRunsOnSubFrames(False)
         self.profile.scripts().insert(link_script)
 
         # Desktop notification presenter
